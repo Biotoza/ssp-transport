@@ -26,15 +26,18 @@ import sh.haven.mosh.transport.MoshTransport
  * user cares about and reads as perfectly healthy, which is exactly the "no
  * automatic reconnect" in the issue title.
  *
- * The escalation these pin must not resurrect #92 (a heuristic that killed
- * live sessions whenever the phone went briefly offline), and must not kill
- * an idle session — which is why it is gated on skips rather than on elapsed
+ * Packets arriving are themselves proof that the server-side session is alive,
+ * so this branch does not consult the host's out-of-band probe — a wedged
+ * session is dead for the user even if the mosh-server process lives. The
+ * escalation these pin must not resurrect #92 (a heuristic that killed live
+ * sessions whenever the phone went briefly offline), and must not kill an
+ * idle session — which is why it is gated on skips rather than on elapsed
  * time alone.
  */
 class StuckReceivingEscalationTest {
 
-    private val online = true
-    private val offline = false
+    private val alive: () -> Boolean? = { false }
+    private val unknown: () -> Boolean? = { null }
 
     /** The reported case: receiving throughout, rejecting everything. */
     @Test
@@ -45,7 +48,26 @@ class StuckReceivingEscalationTest {
             MoshTransport.shouldDeclareDead(
                 recvAgeMs = 0, // packets arriving constantly — silence check blind
                 rebindsSinceReceive = 0,
-                networkAvailable = online,
+                serverSessionDead = unknown,
+                noProgressMs = MoshTransport.NO_PROGRESS_DEAD_MS + 1,
+                skipsSinceProgress = MoshTransport.MIN_SKIPS_BEFORE_DEAD,
+            ),
+        )
+    }
+
+    /**
+     * Even a probe that reached the server and found the process alive must not
+     * save a wedged session: diffs keep arriving and none can be applied, so
+     * the session is dead for the user either way.
+     */
+    @Test
+    fun `declares dead when wedged even if the probe says the session lives`() {
+        assertTrue(
+            "a wedged session is dead however alive the server-side process is",
+            MoshTransport.shouldDeclareDead(
+                recvAgeMs = 0,
+                rebindsSinceReceive = 0,
+                serverSessionDead = alive,
                 noProgressMs = MoshTransport.NO_PROGRESS_DEAD_MS + 1,
                 skipsSinceProgress = MoshTransport.MIN_SKIPS_BEFORE_DEAD,
             ),
@@ -65,7 +87,6 @@ class StuckReceivingEscalationTest {
             MoshTransport.shouldDeclareDead(
                 recvAgeMs = 0,
                 rebindsSinceReceive = 0,
-                networkAvailable = online,
                 noProgressMs = MoshTransport.NO_PROGRESS_DEAD_MS * 100,
                 skipsSinceProgress = 0,
             ),
@@ -79,7 +100,6 @@ class StuckReceivingEscalationTest {
             MoshTransport.shouldDeclareDead(
                 recvAgeMs = 0,
                 rebindsSinceReceive = 0,
-                networkAvailable = online,
                 noProgressMs = MoshTransport.NO_PROGRESS_DEAD_MS + 1,
                 skipsSinceProgress = MoshTransport.MIN_SKIPS_BEFORE_DEAD - 1,
             ),
@@ -93,7 +113,6 @@ class StuckReceivingEscalationTest {
             MoshTransport.shouldDeclareDead(
                 recvAgeMs = 0,
                 rebindsSinceReceive = 0,
-                networkAvailable = online,
                 noProgressMs = MoshTransport.NO_PROGRESS_DEAD_MS - 1,
                 skipsSinceProgress = MoshTransport.MIN_SKIPS_BEFORE_DEAD * 10,
             ),
@@ -101,30 +120,17 @@ class StuckReceivingEscalationTest {
     }
 
     /**
-     * #92 guard, restated for this path: offline is offline. A phone in a
-     * tunnel must resume, not be torn down, no matter what the counters say.
+     * The silence path must NOT escalate on silence alone: with the thresholds
+     * met but no dead verdict from the probe, the session keeps waiting.
      */
     @Test
-    fun `offline never escalates even when stuck`() {
+    fun `the silence path requires a dead verdict from the probe`() {
         assertFalse(
-            MoshTransport.shouldDeclareDead(
-                recvAgeMs = 0,
-                rebindsSinceReceive = 0,
-                networkAvailable = offline,
-                noProgressMs = MoshTransport.NO_PROGRESS_DEAD_MS * 10,
-                skipsSinceProgress = MoshTransport.MIN_SKIPS_BEFORE_DEAD * 10,
-            ),
-        )
-    }
-
-    /** The original silence path must still work exactly as before. */
-    @Test
-    fun `the silence path is unaffected by the new arguments`() {
-        assertTrue(
+            "silence thresholds without a verified dead verdict must not escalate",
             MoshTransport.shouldDeclareDead(
                 recvAgeMs = MoshTransport.DEAD_SESSION_MS + 1,
                 rebindsSinceReceive = MoshTransport.MIN_REBINDS_BEFORE_DEAD,
-                networkAvailable = online,
+                serverSessionDead = unknown,
             ),
         )
     }

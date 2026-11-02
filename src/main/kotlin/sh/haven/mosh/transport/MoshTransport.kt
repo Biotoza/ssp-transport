@@ -51,16 +51,20 @@ class MoshTransport(
     private val socketProvider: sh.haven.mosh.network.UdpSocketProvider =
         sh.haven.mosh.network.UdpSocketProvider { sh.haven.mosh.network.AndroidUdpAdapter() },
     /**
-     * Whether the device currently has a usable network. This is what lets the
-     * transport tell "we are offline, keep waiting" (mosh's whole point — resume
-     * after a tunnel, a pocket, a doze) apart from "we are online but this
-     * session is never coming back", which is the only case [declareDead] acts
-     * on. #92 removed an earlier silence-only death heuristic because it killed
-     * live sessions after 8s offline; gating on connectivity is what stops this
-     * from reintroducing that. Defaults to "assume online" so a host that does
-     * not wire it still gets the #421 escape hatch.
+     * Out-of-band verdict on whether the server-side session still exists,
+     * provided by the host app. The transport itself cannot tell a dead
+     * network from a dead server — both look like receive silence — so it
+     * never gives up on silence alone: it keeps retransmitting and
+     * rebinding its socket for IP roaming, like upstream mosh (#92). Once
+     * silence has persisted past [DEAD_SESSION_MS] with several rebinds
+     * unanswered, the transport consults this callback; only a verified
+     * `true` (e.g. the host SSH'd into the server and found the mosh-server
+     * process gone) escalates to declaring the session dead. `false` means
+     * the session provably still lives — keep waiting. `null` (the default,
+     * when the host wires nothing) means unknown — keep waiting, so a
+     * transport without a probe never kills a session on silence.
      */
-    private val networkAvailable: () -> Boolean = { true },
+    private val serverSessionDead: (() -> Boolean?)? = null,
 ) : Closeable {
 
     private val crypto = MoshCrypto(key)
@@ -379,18 +383,21 @@ class MoshTransport(
                     // retransmit into the void forever behind a "retrying"
                     // banner that never resolves, while the user's own manual
                     // close-and-reconnect (which starts a fresh mosh-server)
-                    // works immediately. Once we have been silent this long,
-                    // have re-bound the socket repeatedly, AND the device does
-                    // have a network, "the network is away" no longer explains
-                    // it: report the transport dead so the session layer can
-                    // reconnect. The connectivity gate is deliberate — with no
-                    // network this never fires, so a phone in a pocket still
-                    // resumes, which is the #92 regression we must not repeat.
+                    // works immediately. But "no packets" alone must never kill
+                    // the session: a dead network looks identical to a dead
+                    // server, and device connectivity sensors lie during
+                    // interface transitions (observed 2026-11-02: Android
+                    // reported a VALIDATED network while data to the server was
+                    // black-holed for an hour). Only the host's out-of-band
+                    // verdict — a probe over the profile's SSH channel that
+                    // found the mosh-server process gone — may escalate.
+                    // Unknown (SSH unreachable) means keep waiting: the #92
+                    // guarantee is now structural, not a guess from a sensor.
                     val noProgressAge = if (lastProgressTimeMs == 0L) 0L else now - lastProgressTimeMs
                     if (shouldDeclareDead(
                             recvAge,
                             rebindsSinceReceive,
-                            networkAvailable(),
+                            serverSessionDead,
                             noProgressAge,
                             skipsSinceProgress,
                         )
@@ -510,52 +517,58 @@ class MoshTransport(
         /** Cadence of socket rebinds during a stall (IP roaming recovery). */
         const val NETWORK_STALL_MS = 6_000L
         /**
-         * Silence after which an ONLINE device treats the session as gone
-         * rather than roaming (#421). Generous on purpose: a real roam (Wi-Fi →
-         * LTE, VPN flap) recovers within a rebind or two, so anything past this
-         * with connectivity present is a session the server no longer has.
-         * Never fires while offline — see [networkAvailable] and #92.
+         * Silence after which the transport starts CONSULTING the host's
+         * out-of-band probe instead of assuming a roam is in progress (#421).
+         * Generous on purpose: a real roam (Wi-Fi → LTE, VPN flap) recovers
+         * within a rebind or two. Silence alone never kills the session —
+         * the probe verdict decides (see [serverSessionDead] and #92).
          */
         const val DEAD_SESSION_MS = 45_000L
         /** Rebinds that must go unanswered before [DEAD_SESSION_MS] can fire. */
         const val MIN_REBINDS_BEFORE_DEAD = 3
 
         /**
-         * Whether a silent session should be given up on (#421). All three
-         * conditions are required, and [networkAvailable] is the one that
-         * matters most: without it this is the #92 heuristic that killed live
-         * sessions whenever the phone went offline briefly. Pure so the policy
-         * is testable without waiting out [DEAD_SESSION_MS] of real time.
+         * Whether a silent session should be given up on (#421). Silence by
+         * itself never decides — [serverSessionDead] is the gate, and only a
+         * verified `true` escalates. `false` (session provably alive) or
+         * `null` (unknown — probe could not reach the server, e.g. the network
+         * is down) keep the session alive; that is the #92 guarantee made
+         * structural rather than a guess from a connectivity sensor. The
+         * callback is invoked lazily, only once the silence thresholds are
+         * already met. Pure so the policy is testable without waiting out
+         * [DEAD_SESSION_MS] of real time.
          */
         fun shouldDeclareDead(
             recvAgeMs: Long,
             rebindsSinceReceive: Int,
-            networkAvailable: Boolean,
+            serverSessionDead: (() -> Boolean?)? = null,
             noProgressMs: Long = 0L,
             skipsSinceProgress: Int = 0,
         ): Boolean =
-            networkAvailable && (
+            (
+                recvAgeMs > DEAD_SESSION_MS &&
+                    rebindsSinceReceive >= MIN_REBINDS_BEFORE_DEAD &&
+                    serverSessionDead?.invoke() == true
+                ) ||
+                // #421 second failure mode: packets keep ARRIVING but none
+                // can be used. The server bases every diff on a state we do
+                // not have, we skip them all, and the silence-based test
+                // above never fires because the receive stream looks
+                // perfectly healthy. Observed in a reporter's log: 90
+                // seconds of nothing but skips, no recovery, no reconnect.
+                //
+                // Gated on skips rather than elapsed time alone, because an
+                // IDLE session also makes no progress — and killing those is
+                // the #92 regression. A session nobody is using produces no
+                // skips at all; only a server actively sending diffs we
+                // cannot apply does. Packets arriving are themselves proof
+                // the server session is alive, so no probe verdict gates
+                // this branch — a wedged session is dead however the
+                // connectivity sensor labels the network.
                 (
-                    recvAgeMs > DEAD_SESSION_MS &&
-                        rebindsSinceReceive >= MIN_REBINDS_BEFORE_DEAD
-                    ) ||
-                    // #421 second failure mode: packets keep ARRIVING but none
-                    // can be used. The server bases every diff on a state we do
-                    // not have, we skip them all, and the silence-based test
-                    // above never fires because the receive stream looks
-                    // perfectly healthy. Observed in a reporter's log: 90
-                    // seconds of nothing but skips, no recovery, no reconnect.
-                    //
-                    // Gated on skips rather than elapsed time alone, because an
-                    // IDLE session also makes no progress — and killing those is
-                    // the #92 regression. A session nobody is using produces no
-                    // skips at all; only a server actively sending diffs we
-                    // cannot apply does.
-                    (
-                        skipsSinceProgress >= MIN_SKIPS_BEFORE_DEAD &&
-                            noProgressMs > NO_PROGRESS_DEAD_MS
-                        )
-                )
+                    skipsSinceProgress >= MIN_SKIPS_BEFORE_DEAD &&
+                        noProgressMs > NO_PROGRESS_DEAD_MS
+                    )
         /**
          * State number mosh-server sends to announce shutdown after the
          * shell exits (uint64 max, i.e. -1). Upstream mosh
