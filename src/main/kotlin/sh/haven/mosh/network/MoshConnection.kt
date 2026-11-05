@@ -27,6 +27,7 @@ class MoshConnection(
     port: Int,
     private val crypto: MoshCrypto,
     private val socketProvider: UdpSocketProvider = UdpSocketProvider { AndroidUdpAdapter() },
+    initialSendNonceSeq: Long = 0L,
 ) : Closeable {
 
     private val serverHost: String = serverIp
@@ -42,7 +43,7 @@ class MoshConnection(
     // provably out of them (receiveInstruction entry / close) — see there.
     private val retiredSockets = ArrayList<UdpSocketAdapter>()
 
-    private var sendNonceSeq = 0L
+    private var sendNonceSeq = initialSendNonceSeq
     private var fragmentIdCounter = 0
 
     // Reuse zlib instances — send is single-threaded, receive is single-threaded
@@ -65,6 +66,22 @@ class MoshConnection(
     private class FragmentAssembly {
         var totalExpected: Int = -1
         val fragments = mutableMapOf<Int, ByteArray>()
+    }
+
+    /**
+     * One-shot liveness probe for orphan cleanup: a minimal empty instruction
+     * with the lowest protocol fields. The peer answers only when it holds the
+     * same session key — a foreign process cannot decrypt it and stays silent.
+     */
+    fun sendProbePacket() {
+        val instruction = TransportInstruction.newBuilder()
+            .setProtocolVersion(sh.haven.mosh.transport.MoshTransport.PROTOCOL_VERSION)
+            .setOldNum(0)
+            .setNewNum(0)
+            .setAckNum(0)
+            .setThrowawayNum(0)
+            .build()
+        sendInstruction(instruction)
     }
 
     /**
