@@ -580,19 +580,20 @@ class MoshTransport(
 
         /**
          * How long a session may keep receiving diffs it cannot apply before
-         * it counts as dead (#421). Shorter than [DEAD_SESSION_MS] because
-         * this state is unambiguous — the peer is talking and we understand
-         * none of it — whereas receive-silence has innocent explanations
-         * (a pocketed phone) that deserve the longer rope.
+         * it counts as dead (#421). Longer than [DEAD_SESSION_MS] on purpose:
+         * a diff crossing with our ack resolves on the next exchange, so a
+         * no-progress wedge usually heals itself and only a sustained one
+         * gets the verdict. Silence gets no such grace, but does not need
+         * it — its branch is gated on the out-of-band probe instead.
          */
-        const val NO_PROGRESS_DEAD_MS = 20_000L
+        const val NO_PROGRESS_DEAD_MS = 120_000L
 
         /**
          * Skips required before [NO_PROGRESS_DEAD_MS] can fire. A couple of
          * skips is ordinary: a diff crossing with our ack resolves itself on
          * the next exchange. A sustained run of them does not.
          */
-        const val MIN_SKIPS_BEFORE_DEAD = 3
+        const val MIN_SKIPS_BEFORE_DEAD = 10
 
         /**
          * Log one in this many sends even when nothing changed, so an
